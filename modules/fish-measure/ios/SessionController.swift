@@ -3,82 +3,90 @@ import Foundation
 import RealityKit
 
 extension simd_float4x4 {
-  var translation: SIMD3<Float> {
-    SIMD3(columns.3.x, columns.3.y, columns.3.z)
-  }
+  var translation: SIMD3<Float> { SIMD3(columns.3.x, columns.3.y, columns.3.z) }
 }
 
 struct RearHit {
   let worldPoint: SIMD3<Float>
-  let method: String      // "mesh" | "existingPlane" | "estimatedPlane"
-  let confidence: String  // "low" | "medium" | "high"
+  let method: String
+  let confidence: String
 }
 
-/// Owns the ARKit world-tracking session used by both rear modes.
-/// - rearCrosshair: raycasts from screen center every frame (throttled to
-///   `updateHz`) and emits smoothed distance events.
-/// - rearTap: `measure(at:)` places a world anchor + marker; the frame loop
-///   keeps emitting the live camera→anchor distance for the latest anchor.
-final class RearSessionController: NSObject, ARSessionDelegate {
+final class SessionController: NSObject, ARSessionDelegate {
   private let arView: ARView
-  private weak var host: LidarARView?
+  private weak var host: FishARView?
   let smoother = DistanceSmoother()
 
   var updateHz: Double = 15
   var showMarkers = true
-  /// Set while heatmap mode is active; receives sceneDepth at the event rate.
-  var onDepthFrame: ((CVPixelBuffer) -> Void)?
-  var mode: String = "rearCrosshair" {
-    didSet {
-      if mode != oldValue {
-        smoother.reset()
-      }
-    }
+  var mode = "auto" {
+    didSet { if oldValue != mode { smoother.reset() } }
   }
+  var enableSceneReconstruction = true
+  var enableHighResolutionCapture = true
+  var debugDepthOverlay = false
 
   private var anchors: [String: AnchorEntity] = [:]
   private var anchorOrder: [String] = []
-  private var lastEventTimestamp: TimeInterval = 0
+  private var lastManualEventTimestamp: TimeInterval = 0
   private var lastProjectedCount = -1
   private var trackingNormal = false
   private(set) var isRunning = false
 
-  init(arView: ARView, host: LidarARView) {
+  init(arView: ARView, host: FishARView) {
     self.arView = arView
     self.host = host
     super.init()
   }
 
-  func start() {
-    guard ARWorldTrackingConfiguration.isSupported else {
-      host?.dispatchError(code: "ar_unsupported", message: "ARKit world tracking is not supported on this device.")
+  func start(resetTracking: Bool = true) {
+    guard ARWorldTrackingConfiguration.isSupported,
+          ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) else {
+      host?.dispatchError(code: "lidar_unsupported", message: "Rear LiDAR scene depth is unavailable.")
       host?.dispatchTrackingState(state: "notAvailable", reason: nil)
       return
     }
 
     let config = ARWorldTrackingConfiguration()
-    if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
-      config.sceneReconstruction = .meshWithClassification
-    } else if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-      config.sceneReconstruction = .mesh
+    if enableSceneReconstruction {
+      if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+        config.sceneReconstruction = .meshWithClassification
+      } else if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+        config.sceneReconstruction = .mesh
+      }
+      arView.environment.sceneUnderstanding.options.insert(.collision)
+    } else {
+      arView.environment.sceneUnderstanding.options.remove(.collision)
     }
-    if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-      config.frameSemantics.insert(.sceneDepth)
+
+    config.frameSemantics.insert(.sceneDepth)
+    if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+      config.frameSemantics.insert(.smoothedSceneDepth)
     }
     config.planeDetection = [.horizontal, .vertical]
+    if enableHighResolutionCapture,
+       let format = ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing {
+      config.videoFormat = format
+    }
 
-    arView.environment.sceneUnderstanding.options.insert(.collision)
     arView.session.delegate = self
-
-    anchors.removeAll()
-    anchorOrder.removeAll()
     smoother.reset()
     trackingNormal = false
-    lastEventTimestamp = 0
-
-    arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+    lastManualEventTimestamp = 0
+    let options: ARSession.RunOptions = resetTracking
+      ? [.resetTracking, .removeExistingAnchors]
+      : []
+    if resetTracking {
+      clearAnchors()
+    }
+    arView.session.run(config, options: options)
     isRunning = true
     host?.dispatchTrackingState(state: "initializing", reason: nil)
+  }
+
+  func restartConfiguration() {
+    guard isRunning else { return }
+    start(resetTracking: false)
   }
 
   func pause() {
@@ -88,64 +96,61 @@ final class RearSessionController: NSObject, ARSessionDelegate {
     trackingNormal = false
   }
 
-  // MARK: - Measurement
+  var currentFrame: ARFrame? { arView.session.currentFrame }
 
-  private var cameraPosition: SIMD3<Float> {
-    arView.cameraTransform.translation
+  func captureHighResolutionFrame(completion: @escaping (ARFrame?, Error?) -> Void) {
+    guard isRunning, enableHighResolutionCapture else {
+      completion(nil, nil)
+      return
+    }
+    arView.session.captureHighResolutionFrame(completion: completion)
   }
 
-  private func distance(to worldPoint: SIMD3<Float>) -> Double {
-    Double(simd_length(worldPoint - cameraPosition))
-  }
+  private var cameraPosition: SIMD3<Float> { arView.cameraTransform.translation }
 
-  /// Three-tier raycast fallback: LiDAR scene mesh → detected plane geometry
-  /// → estimated plane. Tier and tracking quality drive the confidence label.
   func hitTest(at point: CGPoint) -> RearHit? {
     let limited = !trackingNormal
-
-    if let ray = arView.ray(through: point) {
+    if enableSceneReconstruction, let ray = arView.ray(through: point) {
       let hits = arView.scene.raycast(
         origin: ray.origin,
         direction: ray.direction,
         length: 10,
         query: .nearest,
         mask: .all,
-        relativeTo: nil
-      )
+        relativeTo: nil)
       if let hit = hits.first(where: { $0.entity is HasSceneUnderstanding }) {
-        return RearHit(worldPoint: hit.position, method: "mesh", confidence: limited ? "medium" : "high")
+        return RearHit(
+          worldPoint: hit.position,
+          method: "mesh",
+          confidence: limited ? "medium" : "high")
       }
     }
-
-    if let result = arView.raycast(from: point, allowing: .existingPlaneGeometry, alignment: .any).first {
-      return RearHit(worldPoint: result.worldTransform.translation, method: "existingPlane", confidence: limited ? "medium" : "high")
+    if let result = arView.raycast(
+      from: point, allowing: .existingPlaneGeometry, alignment: .any).first {
+      return RearHit(
+        worldPoint: result.worldTransform.translation,
+        method: "existingPlane",
+        confidence: limited ? "medium" : "high")
     }
-
     if let result = arView.raycast(from: point, allowing: .estimatedPlane, alignment: .any).first {
-      return RearHit(worldPoint: result.worldTransform.translation, method: "estimatedPlane", confidence: limited ? "low" : "medium")
+      return RearHit(
+        worldPoint: result.worldTransform.translation,
+        method: "estimatedPlane",
+        confidence: limited ? "low" : "medium")
     }
-
     return nil
   }
 
-  /// Tap-to-measure: raycast, drop a world anchor (so ARKit keeps it glued to
-  /// the surface), and return the measurement. Returns nil on a miss.
   func measure(at point: CGPoint) -> [String: Any]? {
-    guard isRunning else { return nil }
-    guard let hit = hitTest(at: point) else { return nil }
-
+    guard isRunning, mode == "manual", let hit = hitTest(at: point) else { return nil }
     let id = UUID().uuidString
     let anchor = AnchorEntity(world: hit.worldPoint)
-    if showMarkers {
-      anchor.addChild(MarkerEntityFactory.makeMarker())
-    }
+    if showMarkers { anchor.addChild(MarkerEntityFactory.makeMarker()) }
     arView.scene.addAnchor(anchor)
     anchors[id] = anchor
     anchorOrder.append(id)
-    smoother.reset()
-
     return [
-      "meters": distance(to: hit.worldPoint),
+      "meters": Double(simd_length(hit.worldPoint - cameraPosition)),
       "confidence": hit.confidence,
       "anchorId": id,
       "method": hit.method,
@@ -158,9 +163,7 @@ final class RearSessionController: NSObject, ARSessionDelegate {
   }
 
   func clearAnchors() {
-    for (_, anchor) in anchors {
-      arView.scene.removeAnchor(anchor)
-    }
+    for anchor in anchors.values { arView.scene.removeAnchor(anchor) }
     anchors.removeAll()
     anchorOrder.removeAll()
   }
@@ -171,37 +174,32 @@ final class RearSessionController: NSObject, ARSessionDelegate {
     anchorOrder.removeAll { $0 == id }
   }
 
-  // MARK: - ARSessionDelegate
-
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
-    guard updateHz > 0 else { return }
-    guard frame.timestamp - lastEventTimestamp >= 1.0 / updateHz else { return }
-    lastEventTimestamp = frame.timestamp
-    guard mode == "rearCrosshair" || mode == "rearTap" || mode == "heatmap" else { return }
-
-    if mode == "heatmap", let depthMap = frame.sceneDepth?.depthMap {
-      onDepthFrame?(depthMap)
+    if mode == "auto" {
+      host?.consume(frame: frame)
+    }
+    if debugDepthOverlay {
+      let depth = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
+      if let depth { host?.updateDebugDepth(depth) }
     }
 
-    // Center-crosshair distance in all rear modes (in tap mode the JS
-    // readout can toggle to it; heatmap shows it under the crosshair).
+    guard mode == "manual", updateHz > 0,
+          frame.timestamp - lastManualEventTimestamp >= 1.0 / updateHz else { return }
+    lastManualEventTimestamp = frame.timestamp
     if arView.bounds.width > 0 {
       let center = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
       if let hit = hitTest(at: center) {
-        let raw = distance(to: hit.worldPoint)
-        emitDistance(raw: raw, confidence: hit.confidence, method: hit.method)
+        let raw = Double(simd_length(hit.worldPoint - cameraPosition))
+        host?.dispatchDistance(
+          meters: smoother.smooth(raw), raw: raw, confidence: hit.confidence,
+          mode: "manual", method: hit.method)
       }
     }
-
     emitProjectedPoints()
   }
 
-  /// Screen-space projection of every tapped point plus its live distance to
-  /// the camera — the JS overlay draws lines/labels/fill from this.
   private func emitProjectedPoints() {
     guard !anchorOrder.isEmpty else {
-      // Emit the empty set once (so JS clears the overlay), then stay quiet
-      // instead of spamming the bridge 30×/s with nothing.
       if lastProjectedCount != 0 {
         host?.dispatchProjectedPoints(points: [])
         lastProjectedCount = 0
@@ -209,36 +207,28 @@ final class RearSessionController: NSObject, ARSessionDelegate {
       return
     }
     lastProjectedCount = anchorOrder.count
-    let camPos = cameraPosition
     let matrix = arView.cameraTransform.matrix
-    // Camera looks down its local -Z axis.
     let forward = -SIMD3(matrix.columns.2.x, matrix.columns.2.y, matrix.columns.2.z)
-
     var points: [[String: Any]] = []
-    points.reserveCapacity(anchorOrder.count)
     for id in anchorOrder {
       guard let anchor = anchors[id] else { continue }
       let position = anchor.position(relativeTo: nil)
-      let meters = Double(simd_length(position - camPos))
-      let inFront = simd_dot(position - camPos, forward) > 0
-      var entry: [String: Any] = ["id": id, "cameraMeters": meters]
-      if inFront, let screen = arView.project(position) {
-        entry["x"] = Double(screen.x)
-        entry["y"] = Double(screen.y)
-        entry["visible"] = true
+      let visible = simd_dot(position - cameraPosition, forward) > 0
+      var item: [String: Any] = [
+        "id": id,
+        "cameraMeters": Double(simd_length(position - cameraPosition)),
+        "visible": visible,
+      ]
+      if visible, let projected = arView.project(position) {
+        item["x"] = Double(projected.x)
+        item["y"] = Double(projected.y)
       } else {
-        entry["x"] = 0.0
-        entry["y"] = 0.0
-        entry["visible"] = false
+        item["x"] = 0.0
+        item["y"] = 0.0
       }
-      points.append(entry)
+      points.append(item)
     }
     host?.dispatchProjectedPoints(points: points)
-  }
-
-  private func emitDistance(raw: Double, confidence: String, method: String) {
-    let smoothed = smoother.smooth(raw)
-    host?.dispatchDistance(meters: smoothed, raw: raw, confidence: confidence, mode: mode, method: method)
   }
 
   func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
@@ -252,16 +242,11 @@ final class RearSessionController: NSObject, ARSessionDelegate {
     case .limited(let reason):
       trackingNormal = false
       switch reason {
-      case .initializing:
-        host?.dispatchTrackingState(state: "initializing", reason: nil)
-      case .excessiveMotion:
-        host?.dispatchTrackingState(state: "limited", reason: "excessiveMotion")
-      case .insufficientFeatures:
-        host?.dispatchTrackingState(state: "limited", reason: "insufficientFeatures")
-      case .relocalizing:
-        host?.dispatchTrackingState(state: "limited", reason: "relocalizing")
-      @unknown default:
-        host?.dispatchTrackingState(state: "limited", reason: nil)
+      case .initializing: host?.dispatchTrackingState(state: "initializing", reason: nil)
+      case .excessiveMotion: host?.dispatchTrackingState(state: "limited", reason: "excessiveMotion")
+      case .insufficientFeatures: host?.dispatchTrackingState(state: "limited", reason: "insufficientFeatures")
+      case .relocalizing: host?.dispatchTrackingState(state: "limited", reason: "relocalizing")
+      @unknown default: host?.dispatchTrackingState(state: "limited", reason: nil)
       }
     }
   }
@@ -278,6 +263,6 @@ final class RearSessionController: NSObject, ARSessionDelegate {
   }
 
   func sessionInterruptionEnded(_ session: ARSession) {
-    host?.dispatchTrackingState(state: trackingNormal ? "normal" : "initializing", reason: nil)
+    if isRunning { start(resetTracking: false) }
   }
 }
