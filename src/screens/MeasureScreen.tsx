@@ -1,21 +1,63 @@
 import { useIsFocused } from '@react-navigation/native';
-import React from 'react';
+import React, { useEffect } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { FishMeasureView } from '../../modules/fish-measure';
 import { colors } from '../lib/colors';
 import { useDeviceCapabilities } from '../navigation/DeviceCapabilitiesContext';
+import { useThrottledStore } from '../hooks/useThrottledStore';
+import {
+  clearMeasurementStores,
+  measurementStore,
+  receiveMeasurement,
+  receiveSubject,
+  subjectStore,
+} from '../stores/measurementStores';
 
 export function MeasureScreen() {
   const isFocused = useIsFocused();
   const { lidarSupported } = useDeviceCapabilities();
+  const measurement = useThrottledStore(measurementStore, 100);
+  const subject = useThrottledStore(subjectStore, 100);
+  useEffect(() => {
+    if (!isFocused) clearMeasurementStores();
+  }, [isFocused]);
+  const inches = measurement ? measurement.curvedM * 39.3700787402 : null;
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <View style={styles.camera}>
         {isFocused && lidarSupported ? (
-          <FishMeasureView mode="auto" style={StyleSheet.absoluteFill} />
+          <FishMeasureView
+            mode="auto"
+            updateHz={15}
+            enableSceneReconstruction={false}
+            enableHighResCapture
+            segmentation={{
+              hz: 10,
+              depthSource: 'smoothed',
+              personExclusion: true,
+              personMaskDilationPx: 2,
+              subjectClosingPx: 2,
+              priorityRegion: { x: 0.12, y: 0.31, w: 0.76, h: 0.28 },
+            }}
+            classifier={{
+              enabled: true,
+              hz: 2,
+              minConfidence: 0.15,
+              acceptLabels: ['fish', 'tench', 'goldfish', 'coho', 'sturgeon', 'gar', 'eel'],
+              vetoLabels: ['person', 'hand', 'rock', 'net'],
+              requiredForAutoCapture: true,
+            }}
+            tracking={{ minCandidateFrames: 2, minLockFrames: 4, lostGraceMs: 350 }}
+            centerline={{ algorithm: 'pca', bins: 48 }}
+            stability={{ windowMs: 750, minDepthCoverage: 0.7 }}
+            overlay={{ contourMaxPoints: 120, emitCenterline: true }}
+            onSubject={(event) => receiveSubject(event.nativeEvent)}
+            onFishMeasurement={(event) => receiveMeasurement(event.nativeEvent)}
+            style={StyleSheet.absoluteFill}
+          />
         ) : (
           <View style={styles.unsupported}>
             <Text style={styles.unsupportedTitle}>LiDAR iPhone required</Text>
@@ -31,13 +73,19 @@ export function MeasureScreen() {
         <View style={styles.topBar}>
           <Text style={styles.brand}>FISH MEASURE 2</Text>
           <View style={styles.modeChip}>
-            <Text style={styles.modeText}>AUTO</Text>
+            <Text style={styles.modeText}>{subject?.state.toUpperCase() ?? 'AUTO'}</Text>
           </View>
         </View>
         <View style={styles.readout}>
-          <Text style={styles.readoutValue}>—.—</Text>
+          <Text style={styles.readoutValue}>{inches == null ? '—.—' : inches.toFixed(1)}</Text>
           <Text style={styles.readoutUnit}>in</Text>
-          <Text style={styles.readoutHint}>Fit the fish inside the outline</Text>
+          <Text style={styles.readoutHint}>
+            {measurement?.autoCaptureEligible
+              ? 'Stable — ready to capture'
+              : subject?.state === 'locked'
+                ? 'Hold steady'
+                : 'Fit the fish inside the outline'}
+          </Text>
         </View>
         <View style={styles.captureButton}>
           <View style={styles.captureInner} />

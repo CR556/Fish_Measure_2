@@ -1,0 +1,61 @@
+export type MeasureMode = 'auto' | 'manual';
+export type SpeciesSource = 'ai' | 'user' | 'none';
+export type ValueSource = 'ai' | 'user' | 'formula' | 'measured' | 'none';
+
+export type CatchRecord = {
+  id: string;
+  created_at: number;
+  updated_at: number;
+  measure_mode: MeasureMode;
+  length_curved_m: number;
+  length_chord_m: number;
+  length_source: ValueSource;
+  girth_m: number | null;
+  girth_source: ValueSource;
+  weight_kg: number | null;
+  weight_source: ValueSource;
+  weight_formula: string | null;
+  measure_confidence: number;
+  distance_m: number;
+  depth_coverage: number;
+  species_id: string | null;
+  species_confidence: number | null;
+  species_source: SpeciesSource;
+  ai_suggestions: string | null;
+  user_corrected: number;
+  bait: string | null;
+  bait_source: SpeciesSource;
+  lat: number | null;
+  lon: number | null;
+  loc_accuracy_m: number | null;
+  location_timestamp: number | null;
+  location_label: string | null;
+  photo_path: string;
+  thumb_path: string;
+  ply_path: string | null;
+  mask_path: string | null;
+  contour_json_path: string;
+  notes: string;
+  units_at_capture: 'imperial' | 'metric';
+  photo_source: 'highRes' | 'videoFrame' | 'snapshot';
+  photo_width: number;
+  photo_height: number;
+  registration_status: 'registered' | 'fallbackAlignedFrame' | 'unavailable';
+  registration_score: number | null;
+  capture_frame_id: number;
+  algorithm_version: string;
+  schema_version: number;
+};
+
+export type CatchFilter = {
+  speciesId?: string;
+  minLengthM?: number;
+  maxLengthM?: number;
+  minWeightKg?: number;
+  maxWeightKg?: number;
+  createdAfter?: number;
+  createdBefore?: number;
+  search?: string;
+};
+
+export type CatchSort = 'newest' | 'oldest' | 'longest' | 'heaviest';
