@@ -1,0 +1,16 @@
+export const colors = {
+  ink: '#071014',
+  cameraInk: '#020709',
+  panel: '#0D1C22',
+  panelRaised: '#122831',
+  border: '#24404A',
+  text: '#F2F8FA',
+  textMuted: '#91A7AE',
+  aqua: '#31D6C4',
+  blue: '#3AA8FF',
+  amber: '#FFB547',
+  keep: '#39D98A',
+  discard: '#FF5A67',
+  white: '#FFFFFF',
+  black: '#000000',
+} as const;

@@ -1,0 +1,98 @@
+# Free-account distribution path: builds an UNSIGNED IPA on a macOS runner.
+# Download the artifact and sign + install it from Windows with Sideloadly
+# (free Apple ID, app expires after 7 days — re-run Sideloadly on the same
+# IPA to renew, no rebuild needed).
+#
+# Configuration input:
+#   Debug   -> dev client with the launcher UI (connects to Metro on your PC).
+#              Use this first: hot-reload iteration, rarely needs rebuilding.
+#   Release -> standalone app with the JS bundle embedded (runs without a PC).
+name: iOS Unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Build configuration
+        type: choice
+        default: Debug
+        options:
+          - Debug
+          - Release
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Expo SDK 57's autolinking package requires Swift 6.2 tools, but the
+      # macos-15 image defaults to Xcode 16.4 (Swift 6.1). Select the newest
+      # installed Xcode 26.x (version-sorted so a runner minor-version bump
+      # doesn't break this).
+      - name: Select Xcode 26 (Swift 6.2)
+        run: |
+          set -eo pipefail
+          XCODE=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -n1)
+          echo "Selecting $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          swift --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate native project (prebuild)
+        run: npx expo prebuild -p ios --no-install
+
+      - name: Install CocoaPods
+        working-directory: ios
+        run: pod install
+
+      - name: Detect workspace and scheme
+        id: xc
+        working-directory: ios
+        run: |
+          WORKSPACE=$(ls -d *.xcworkspace | head -n 1)
+          echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          echo "scheme=${WORKSPACE%.xcworkspace}" >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned app
+        working-directory: ios
+        run: |
+          set -eo pipefail
+          xcodebuild \
+            -workspace "${{ steps.xc.outputs.workspace }}" \
+            -scheme "${{ steps.xc.outputs.scheme }}" \
+            -configuration "${{ inputs.configuration }}" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            build
+
+      - name: Package IPA
+        working-directory: ios
+        run: |
+          set -eo pipefail
+          APP=$(ls -d "build/Build/Products/${{ inputs.configuration }}-iphoneos"/*.app | head -n 1)
+          echo "Packaging $APP"
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/
+          cd build
+          zip -qry "app-unsigned-${{ inputs.configuration }}.ipa" Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-unsigned-${{ inputs.configuration }}
+          path: ios/build/app-unsigned-${{ inputs.configuration }}.ipa
+          retention-days: 14
+          if-no-files-found: error
