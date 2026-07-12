@@ -27,6 +27,7 @@ final class FishPipeline {
   private var latestSnapshot: FishPipelineSnapshot?
   private var tapHintViewPoint: CGPoint?
   private var tapHintSetAtMs: Double = 0
+  private var lastTrackedSubject: SegmentedSubject?
 
   private var segmentation = SegmentationParams()
   private var classifier = ClassifierParams()
@@ -124,6 +125,7 @@ final class FishPipeline {
       self?.latestSnapshot = nil
       self?.tapHintViewPoint = nil
       self?.stateLock.unlock()
+      self?.lastTrackedSubject = nil
     }
   }
 
@@ -149,9 +151,9 @@ final class FishPipeline {
       packet: packet)
     let tapHint = currentTapHint(packet: packet, ttlMs: tracking.tapHintTtlMs)
     let segmentationStart = CACurrentMediaTime()
-    let subject: SegmentedSubject?
+    let detectedSubject: SegmentedSubject?
     do {
-      subject = try segmenter.segment(
+      detectedSubject = try segmenter.segment(
         image: packet.capturedImage,
         params: segmentation,
         tapHint: tapHint)
@@ -161,7 +163,18 @@ final class FishPipeline {
       return
     }
     let segmentationMs = elapsedMs(segmentationStart)
-    let trackingResult = tracker.update(subject: subject, timestamp: packet.timestamp, params: tracking)
+    let trackingResult = tracker.update(
+      subject: detectedSubject, timestamp: packet.timestamp, params: tracking)
+    let subject: SegmentedSubject?
+    if trackingResult.acceptsDetectedSubject {
+      subject = detectedSubject
+      lastTrackedSubject = detectedSubject
+    } else if trackingResult.state == "locked" {
+      subject = lastTrackedSubject
+    } else {
+      subject = nil
+      lastTrackedSubject = nil
+    }
     guard let subject else {
       emitSubject(
         frameId: frameId, packet: packet, subject: nil, contour: [], tracking: trackingResult,

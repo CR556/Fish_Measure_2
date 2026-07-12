@@ -4,13 +4,13 @@ const config: ExpoConfig = {
   name: 'Fish Measure 2',
   slug: 'fish-measure-2',
   scheme: 'fishmeasure2',
-  version: '0.2.1',
+  version: '0.2.2',
   orientation: 'portrait',
   icon: './assets/icon.png',
   userInterfaceStyle: 'dark',
   ios: {
     bundleIdentifier: 'com.fishmeasure2.app',
-    buildNumber: '3',
+    buildNumber: '4',
     supportsTablet: false,
     infoPlist: {
       NSCameraUsageDescription:

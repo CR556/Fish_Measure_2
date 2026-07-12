@@ -11,6 +11,7 @@ import {
   Text,
   View,
   type GestureResponderEvent,
+  type LayoutChangeEvent,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -22,12 +23,14 @@ import {
   type FishMode,
   type ManualCapturePayload,
   type ManualPathMeasurement,
+  type ProjectedPointsEvent,
   type SubjectEvent,
   type ViewPoint,
 } from '../../modules/fish-measure';
 import { MeasurementOverlay } from '../components/measure/MeasurementOverlay';
 import { useThrottledStore } from '../hooks/useThrottledStore';
 import { colors } from '../lib/colors';
+import { projectionStore } from '../lib/projectionStore';
 import type { RootStackParamList } from '../navigation/types';
 import { useDeviceCapabilities } from '../navigation/DeviceCapabilitiesContext';
 import { putCaptureDraft } from '../stores/captureDraftStore';
@@ -69,11 +72,16 @@ export function MeasureScreen() {
   const previousAutoEligible = useRef(false);
   const lastCaptureAt = useRef(0);
   const capturingRef = useRef(false);
+  const manualAnchorIdsRef = useRef<string[]>([]);
+  const manualMeasurementRef = useRef<ManualPathMeasurement | null>(null);
+  const manualMeasureInFlight = useRef(false);
+  const manualMeasureAttempted = useRef(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [mode, setMode] = useState<Exclude<FishMode, 'off'>>('auto');
   const [capturing, setCapturing] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
-  const [manualPoints, setManualPoints] = useState<ViewPoint[]>([]);
+  const [cameraSize, setCameraSize] = useState({ width: 0, height: 0 });
+  const [manualAnchorIds, setManualAnchorIds] = useState<string[]>([]);
   const [manualMeasurement, setManualMeasurement] = useState<ManualPathMeasurement | null>(null);
   const measurement = useThrottledStore(measurementStore, 100);
   const subject = useThrottledStore(subjectStore, 100);
@@ -84,6 +92,25 @@ export function MeasureScreen() {
     toastTimer.current = setTimeout(() => setToast(null), 2600);
   }, []);
 
+  const updateManualAnchors = useCallback((ids: string[]) => {
+    manualAnchorIdsRef.current = ids;
+    manualMeasureAttempted.current = false;
+    setManualAnchorIds(ids);
+  }, []);
+
+  const updateManualMeasurement = useCallback((value: ManualPathMeasurement | null) => {
+    manualMeasurementRef.current = value;
+    setManualMeasurement(value);
+  }, []);
+
+  const resetManual = useCallback(() => {
+    updateManualAnchors([]);
+    updateManualMeasurement(null);
+    manualMeasureInFlight.current = false;
+    projectionStore.clear();
+    void viewRef.current?.clearAnchors();
+  }, [updateManualAnchors, updateManualMeasurement]);
+
   useEffect(() => () => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
   }, []);
@@ -92,8 +119,9 @@ export function MeasureScreen() {
     if (!isFocused) {
       clearMeasurementStores();
       previousAutoEligible.current = false;
+      resetManual();
     }
-  }, [isFocused]);
+  }, [isFocused, resetManual]);
 
   const createOutputDirectory = useCallback(() => {
     const id = randomUUID();
@@ -143,16 +171,24 @@ export function MeasureScreen() {
     }
   }, [createOutputDirectory, finishCapture, showToast]);
 
+  const currentManualViewPoints = useCallback((): ViewPoint[] | null => {
+    const projected = projectionStore.get();
+    const points = manualAnchorIdsRef.current.map((id) => projected[id]);
+    if (points.length !== 3 || points.some((point) => !point?.visible)) return null;
+    return points.map((point) => ({ x: point.x, y: point.y }));
+  }, []);
+
   const captureManual = useCallback(async () => {
-    if (capturingRef.current || manualPoints.length < 2) {
-      showToast('Tap the nose and tail first');
+    const points = currentManualViewPoints();
+    if (capturingRef.current || !points || !manualMeasurementRef.current) {
+      showToast('Place all three points and keep them visible');
       return;
     }
     capturingRef.current = true;
     setCapturing(true);
     const { id, directory } = createOutputDirectory();
     try {
-      const payload = await viewRef.current?.captureManualCatch(manualPoints, {
+      const payload = await viewRef.current?.captureManualCatch(points, {
         outputDir: directory.uri,
         includePly: false,
         includeMaskPng: false,
@@ -171,7 +207,7 @@ export function MeasureScreen() {
       capturingRef.current = false;
       setCapturing(false);
     }
-  }, [createOutputDirectory, finishCapture, manualPoints, showToast]);
+  }, [createOutputDirectory, currentManualViewPoints, finishCapture, showToast]);
 
   const handleSubject = useCallback((event: { nativeEvent: SubjectEvent }) => {
     const next = event.nativeEvent;
@@ -200,41 +236,75 @@ export function MeasureScreen() {
       x: event.nativeEvent.locationX,
       y: event.nativeEvent.locationY,
     };
-    if (mode === 'auto') {
-      await viewRef.current?.setTapHint(point.x, point.y);
-      showToast('Selection focused here');
-      void Haptics.selectionAsync();
+    await viewRef.current?.setTapHint(point.x, point.y);
+    showToast('Selection focused here');
+    void Haptics.selectionAsync();
+  }, [showToast]);
+
+  const handleProjectedPoints = useCallback((event: { nativeEvent: ProjectedPointsEvent }) => {
+    const projected = event.nativeEvent.points;
+    projectionStore.set(projected);
+    const ids = manualAnchorIdsRef.current;
+    if (ids.length !== 3 || manualMeasureInFlight.current || manualMeasureAttempted.current) return;
+    const byId = Object.fromEntries(projected.map((point) => [point.id, point]));
+    const ordered = ids.map((id) => byId[id]);
+    if (ordered.some((point) => !point?.visible)) return;
+    const points = ordered.map((point) => ({ x: point.x, y: point.y }));
+    const measurePromise = viewRef.current?.measureManualPath(points, 64);
+    if (!measurePromise) return;
+    manualMeasureInFlight.current = true;
+    manualMeasureAttempted.current = true;
+    void measurePromise.then((result) => {
+      updateManualMeasurement(result ?? null);
+      if (result) void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      else showToast('No continuous LiDAR depth across the three points');
+    }).finally(() => {
+      manualMeasureInFlight.current = false;
+    });
+  }, [showToast, updateManualMeasurement]);
+
+  const addManualPoint = useCallback(async () => {
+    if (manualAnchorIdsRef.current.length >= 3 || cameraSize.width <= 0 || cameraSize.height <= 0) return;
+    const result = await viewRef.current?.measureAtPoint(cameraSize.width / 2, cameraSize.height / 2);
+    if (!result) {
+      showToast('No LiDAR surface at the crosshair — aim at the fish body');
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
       return;
     }
-    const nextPoints = manualPoints.length >= 2 ? [point] : [...manualPoints, point];
-    setManualPoints(nextPoints);
-    setManualMeasurement(null);
-    if (nextPoints.length === 2) {
-      const result = await viewRef.current?.measureManualPath(nextPoints, 48);
-      setManualMeasurement(result ?? null);
-      if (result) void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-      else showToast('No usable LiDAR depth on that path');
-    }
-  }, [manualPoints, mode, showToast]);
+    updateManualMeasurement(null);
+    updateManualAnchors([...manualAnchorIdsRef.current, result.anchorId]);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [cameraSize.height, cameraSize.width, showToast, updateManualAnchors, updateManualMeasurement]);
+
+  const undoManualPoint = useCallback(async () => {
+    const current = manualAnchorIdsRef.current;
+    const anchorId = current[current.length - 1];
+    if (!anchorId) return;
+    await viewRef.current?.removeAnchor(anchorId);
+    updateManualMeasurement(null);
+    updateManualAnchors(current.slice(0, -1));
+    void Haptics.selectionAsync();
+  }, [updateManualAnchors, updateManualMeasurement]);
 
   const changeMode = useCallback((nextMode: 'auto' | 'manual') => {
     setMode(nextMode);
-    setManualPoints([]);
-    setManualMeasurement(null);
+    resetManual();
     clearMeasurementStores();
     previousAutoEligible.current = false;
     void viewRef.current?.clearSubject();
-  }, []);
+  }, [resetManual]);
 
   const displayedMeters = mode === 'manual'
     ? manualMeasurement?.curvedM ?? null
     : measurement?.curvedM ?? null;
   const inches = displayedMeters == null ? null : displayedMeters * 39.3700787402;
   const status = mode === 'manual'
-    ? manualPoints.length === 0
-      ? 'Tap the nose, then the tail'
-      : manualPoints.length === 1
-        ? 'Now tap the tail'
+    ? manualAnchorIds.length === 0
+      ? 'Aim at the head or tail, then press +'
+      : manualAnchorIds.length === 1
+        ? 'Aim at the midpoint, then press +'
+        : manualAnchorIds.length === 2
+          ? 'Aim at the opposite head or tail, then press +'
         : manualMeasurement
           ? 'Manual path measured — ready to capture'
           : 'Checking LiDAR depth…'
@@ -243,12 +313,16 @@ export function MeasureScreen() {
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
-      <View style={styles.camera}>
+      <View
+        style={styles.camera}
+        onLayout={(event: LayoutChangeEvent) => setCameraSize(event.nativeEvent.layout)}
+      >
         {isFocused && lidarSupported ? (
           <FishMeasureView
             ref={viewRef}
             mode={mode}
             updateHz={15}
+            showNativeMarkers={mode === 'manual'}
             enableSceneReconstruction={mode === 'manual'}
             enableHighResCapture
             segmentation={{
@@ -268,7 +342,15 @@ export function MeasureScreen() {
               vetoLabels: ['person', 'hand', 'rock', 'net'],
               requiredForAutoCapture: false,
             }}
-            tracking={{ minCandidateFrames: 2, minLockFrames: 4, lostGraceMs: 350 }}
+            tracking={{
+              minCandidateFrames: 2,
+              minLockFrames: 4,
+              lostGraceMs: 1400,
+              maxCentroidJumpFraction: 0.3,
+              maxLengthJumpFraction: 0.35,
+              maxMismatchFrames: 10,
+              tapHintTtlMs: 8000,
+            }}
             centerline={{
               algorithm: 'pca',
               bins: 48,
@@ -290,6 +372,7 @@ export function MeasureScreen() {
             debugMode
             onSubject={handleSubject}
             onFishMeasurement={handleMeasurement}
+            onProjectedPoints={handleProjectedPoints}
             onError={(event) => showToast(event.nativeEvent.message)}
             style={StyleSheet.absoluteFill}
           />
@@ -302,12 +385,24 @@ export function MeasureScreen() {
           </View>
         )}
 
-        <Pressable style={StyleSheet.absoluteFill} onPress={handleCameraPress} />
+        <Pressable
+          pointerEvents={mode === 'auto' ? 'auto' : 'none'}
+          style={StyleSheet.absoluteFill}
+          onPress={handleCameraPress}
+        />
         <MeasurementOverlay
           subject={mode === 'auto' ? subject : null}
           measurement={mode === 'auto' ? measurement : null}
-          manualPoints={mode === 'manual' ? manualPoints : []}
+          manualAnchorIds={mode === 'manual' ? manualAnchorIds : []}
         />
+
+        {mode === 'manual' ? (
+          <View pointerEvents="none" style={styles.crosshair}>
+            <View style={styles.crosshairHorizontal} />
+            <View style={styles.crosshairVertical} />
+            <View style={styles.crosshairCenter} />
+          </View>
+        ) : null}
 
         <View style={styles.topBar} pointerEvents="box-none">
           <Text style={styles.brand}>FISH MEASURE 2</Text>
@@ -356,17 +451,42 @@ export function MeasureScreen() {
           <Text style={styles.readoutHint}>{status}</Text>
         </View>
 
-        <Pressable
-          disabled={capturing}
-          onPress={() => void (mode === 'auto' ? captureAuto() : captureManual())}
-          style={({ pressed }) => [
-            styles.captureButton,
-            pressed && styles.captureButtonPressed,
-            capturing && styles.captureButtonDisabled,
-          ]}
-        >
-          {capturing ? <ActivityIndicator color={colors.ink} /> : <View style={styles.captureInner} />}
-        </Pressable>
+        {mode === 'manual' && manualAnchorIds.length < 3 ? (
+          <Pressable
+            disabled={capturing || (mode === 'manual' && !manualMeasurement)}
+            onPress={() => void addManualPoint()}
+            style={({ pressed }) => [
+              styles.captureButton,
+              styles.addPointButton,
+              pressed && styles.captureButtonPressed,
+            ]}
+          >
+            <Text style={styles.addPointText}>+</Text>
+          </Pressable>
+        ) : (
+          <Pressable
+            disabled={capturing}
+            onPress={() => void (mode === 'auto' ? captureAuto() : captureManual())}
+            style={({ pressed }) => [
+              styles.captureButton,
+              pressed && styles.captureButtonPressed,
+              (capturing || (mode === 'manual' && !manualMeasurement)) &&
+                styles.captureButtonDisabled,
+            ]}
+          >
+            {capturing ? (
+              <ActivityIndicator color={colors.ink} />
+            ) : (
+              <View style={styles.captureInner} />
+            )}
+          </Pressable>
+        )}
+
+        {mode === 'manual' && manualAnchorIds.length > 0 ? (
+          <Pressable onPress={() => void undoManualPoint()} style={styles.undoButton}>
+            <Text style={styles.undoText}>UNDO</Text>
+          </Pressable>
+        ) : null}
 
         {toast ? (
           <View style={styles.toast} pointerEvents="none">
@@ -423,6 +543,29 @@ const styles = StyleSheet.create({
   captureButtonPressed: { transform: [{ scale: 0.94 }] },
   captureButtonDisabled: { opacity: 0.65 },
   captureInner: { width: '100%', height: '100%', borderRadius: 99, backgroundColor: colors.white },
+  addPointButton: { backgroundColor: colors.aqua, borderColor: colors.white },
+  addPointText: { color: colors.ink, fontSize: 38, fontWeight: '500', lineHeight: 42 },
+  undoButton: {
+    position: 'absolute', bottom: 31, left: '50%', marginLeft: 48,
+    height: 46, minWidth: 62, paddingHorizontal: 10, borderRadius: 23,
+    alignItems: 'center', justifyContent: 'center',
+    backgroundColor: 'rgba(7,16,20,0.9)', borderColor: colors.amber, borderWidth: 1,
+  },
+  undoText: { color: colors.amber, fontSize: 11, fontWeight: '900', letterSpacing: 0.7 },
+  crosshair: {
+    position: 'absolute', left: '50%', top: '50%', width: 54, height: 54,
+    marginLeft: -27, marginTop: -27, alignItems: 'center', justifyContent: 'center',
+  },
+  crosshairHorizontal: {
+    position: 'absolute', width: 54, height: 2, backgroundColor: colors.aqua,
+  },
+  crosshairVertical: {
+    position: 'absolute', width: 2, height: 54, backgroundColor: colors.aqua,
+  },
+  crosshairCenter: {
+    width: 9, height: 9, borderRadius: 5, borderWidth: 2,
+    borderColor: colors.white, backgroundColor: colors.cameraInk,
+  },
   toast: {
     position: 'absolute', alignSelf: 'center', bottom: 188, maxWidth: '86%',
     backgroundColor: colors.panelRaised, borderColor: colors.border, borderWidth: 1,

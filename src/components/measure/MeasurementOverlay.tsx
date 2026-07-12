@@ -5,7 +5,7 @@ import {
   Skia,
   usePathInterpolation,
 } from '@shopify/react-native-skia';
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { StyleSheet, useWindowDimensions } from 'react-native';
 import { useSharedValue, withTiming } from 'react-native-reanimated';
 
@@ -15,11 +15,12 @@ import type {
   ViewPoint,
 } from '../../../modules/fish-measure/src/FishMeasure.types';
 import { colors } from '../../lib/colors';
+import { projectionStore } from '../../lib/projectionStore';
 
 type Props = {
   subject: SubjectEvent | null;
   measurement: FishMeasurementEvent | null;
-  manualPoints?: ViewPoint[];
+  manualAnchorIds?: string[];
 };
 
 function pointsFromFlat(values: number[]) {
@@ -59,8 +60,17 @@ function ghostPoints(count: number, width: number, height: number) {
   return points;
 }
 
-export function MeasurementOverlay({ subject, measurement, manualPoints = [] }: Props) {
+export function MeasurementOverlay({ subject, measurement, manualAnchorIds = [] }: Props) {
   const { width, height } = useWindowDimensions();
+  const projectedPoints = useSyncExternalStore(
+    projectionStore.subscribe,
+    projectionStore.get,
+    projectionStore.get
+  );
+  const manualPoints = manualAnchorIds.flatMap((id) => {
+    const point = projectedPoints[id];
+    return point?.visible ? [{ x: point.x, y: point.y }] : [];
+  });
   const livePoints = useMemo(() => pointsFromFlat(subject?.contour ?? []), [subject?.contour]);
   const pointCount = Math.max(4, livePoints.length);
   const ghost = useMemo(() => ghostPoints(pointCount, width, height), [height, pointCount, width]);

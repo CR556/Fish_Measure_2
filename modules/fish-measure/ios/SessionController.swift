@@ -110,6 +110,7 @@ final class SessionController: NSObject, ARSessionDelegate {
 
   func hitTest(at point: CGPoint) -> RearHit? {
     let limited = !trackingNormal
+    if let depthHit = depthHit(at: point, limited: limited) { return depthHit }
     if enableSceneReconstruction, let ray = arView.ray(through: point) {
       let hits = arView.scene.raycast(
         origin: ray.origin,
@@ -139,6 +140,75 @@ final class SessionController: NSObject, ARSessionDelegate {
         confidence: limited ? "low" : "medium")
     }
     return nil
+  }
+
+  /// Scene reconstruction and plane raycasts often land on the wall behind a
+  /// fish held in the air. Sample LiDAR scene depth first so manual anchors are
+  /// attached to the visible fish surface and remain fixed in AR world space.
+  private func depthHit(at point: CGPoint, limited: Bool) -> RearHit? {
+    guard let frame = currentFrame,
+          arView.bounds.width > 0, arView.bounds.height > 0,
+          let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
+    let orientation = arView.window?.windowScene?.interfaceOrientation ?? .portrait
+    let displayTransform = frame.displayTransform(
+      for: orientation, viewportSize: arView.bounds.size)
+    let viewNormalized = CGPoint(
+      x: point.x / arView.bounds.width,
+      y: point.y / arView.bounds.height)
+    let sensor = viewNormalized.applying(displayTransform.inverted())
+    guard sensor.x >= 0, sensor.x <= 1, sensor.y >= 0, sensor.y <= 1 else { return nil }
+
+    let depthMap = depthData.depthMap
+    let confidenceMap = depthData.confidenceMap
+    CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+    if let confidenceMap { CVPixelBufferLockBaseAddress(confidenceMap, .readOnly) }
+    defer {
+      if let confidenceMap { CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly) }
+      CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+    }
+    guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+    let width = CVPixelBufferGetWidth(depthMap), height = CVPixelBufferGetHeight(depthMap)
+    let centerX = min(width - 1, max(0, Int(sensor.x * CGFloat(width))))
+    let centerY = min(height - 1, max(0, Int(sensor.y * CGFloat(height))))
+    let depthStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
+    let depthValues = depthBase.assumingMemoryBound(to: Float32.self)
+    let confidenceBase: UnsafeMutablePointer<UInt8>?
+    let confidenceStride: Int
+    if let confidenceMap, let base = CVPixelBufferGetBaseAddress(confidenceMap) {
+      confidenceBase = base.assumingMemoryBound(to: UInt8.self)
+      confidenceStride = CVPixelBufferGetBytesPerRow(confidenceMap)
+    } else {
+      confidenceBase = nil
+      confidenceStride = 0
+    }
+    var candidates: [(depth: Double, confidence: Int)] = []
+    for y in max(0, centerY - 2)...min(height - 1, centerY + 2) {
+      for x in max(0, centerX - 2)...min(width - 1, centerX + 2) {
+        let confidence = confidenceBase.map { Int($0[y * confidenceStride + x]) } ?? 1
+        guard confidence >= 1 else { continue }
+        let depth = Double(depthValues[y * depthStride + x])
+        if depth.isFinite && depth > 0.05 && depth < 10 {
+          candidates.append((depth, confidence))
+        }
+      }
+    }
+    guard !candidates.isEmpty else { return nil }
+    candidates.sort { $0.depth < $1.depth }
+    let selected = candidates[min(candidates.count - 1, candidates.count / 4)]
+    let z = Float(selected.depth)
+    let u = Float(sensor.x * frame.camera.imageResolution.width)
+    let v = Float(sensor.y * frame.camera.imageResolution.height)
+    let intrinsics = frame.camera.intrinsics
+    let cameraPoint = SIMD4<Float>(
+      (u - intrinsics.columns.2.x) * z / intrinsics.columns.0.x,
+      -(v - intrinsics.columns.2.y) * z / intrinsics.columns.1.y,
+      -z,
+      1)
+    let world = frame.camera.transform * cameraPoint
+    return RearHit(
+      worldPoint: SIMD3(world.x, world.y, world.z),
+      method: "depth",
+      confidence: limited || selected.confidence < 2 ? "medium" : "high")
   }
 
   func measure(at point: CGPoint) -> [String: Any]? {

@@ -75,6 +75,7 @@ struct TrackingParams: Record {
   @Field var lostGraceMs: Double = 350
   @Field var maxCentroidJumpFraction: Double = 0.2
   @Field var maxLengthJumpFraction: Double = 0.15
+  @Field var maxMismatchFrames: Int = 8
   @Field var tapHintTtlMs: Double = 3000
   @Field var relockCooldownMs: Double = 500
 }

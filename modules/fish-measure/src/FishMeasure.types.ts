@@ -66,6 +66,7 @@ export type TrackingConfig = {
   lostGraceMs?: number;
   maxCentroidJumpFraction?: number;
   maxLengthJumpFraction?: number;
+  maxMismatchFrames?: number;
   tapHintTtlMs?: number;
   relockCooldownMs?: number;
 };
