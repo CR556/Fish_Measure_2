@@ -83,6 +83,12 @@ struct CenterlineParams: Record {
   @Field var algorithm: String = "pca"
   @Field var bins: Int = 48
   @Field var depthSampleRadiusPx: Int = 2
+  @Field var depthTransverseSamples: Int = 7
+  @Field var depthTransverseInsetFraction: Double = 0.15
+  @Field var depthForegroundQuantile: Double = 0.25
+  @Field var maxDepthStepM: Double = 0.08
+  @Field var maxDepthStepFraction: Double = 0.12
+  @Field var depthEnvelopeMarginM: Double = 0.05
   @Field var depthFitDegree: Int = 3
   @Field var outlierRejectSigma: Double = 2.5
   @Field var maxGapBinFraction: Double = 0.25
@@ -97,11 +103,12 @@ struct GirthParams: Record {
 
 struct StabilityParams: Record {
   @Field var windowMs: Double = 750
-  @Field var maxDeltaCm: Double = 0.5
-  @Field var maxDeltaFraction: Double = 0.015
+  @Field var maxDeltaCm: Double = 1
+  @Field var maxDeltaFraction: Double = 0.025
+  @Field var trimOutlierFrames: Int = 1
   @Field var minDistanceM: Double = 0.3
   @Field var maxDistanceM: Double = 2.5
-  @Field var minDepthCoverage: Double = 0.7
+  @Field var minDepthCoverage: Double = 0.6
 }
 
 struct OverlayParams: Record {

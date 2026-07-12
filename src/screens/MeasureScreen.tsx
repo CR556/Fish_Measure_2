@@ -46,7 +46,7 @@ function gateMessage(subject: SubjectEvent | null, measurement: FishMeasurementE
   if (subject.state === 'candidate') return 'Fish-shaped subject found — hold it steady';
   if (!subject.fishGatePassed) return 'Shape locked — classifier is still checking the subject';
   if (!measurement) return 'Shape locked — tilt slightly to improve LiDAR depth';
-  if (measurement.depthCoverage < 0.7) return 'Low depth coverage — reduce glare or move closer';
+  if (measurement.depthCoverage < 0.6) return 'Low depth coverage — reduce glare or move closer';
   if (!measurement.stable) return 'Measurement found — hold steady';
   return 'Stable — ready to capture';
 }
@@ -269,8 +269,23 @@ export function MeasureScreen() {
               requiredForAutoCapture: false,
             }}
             tracking={{ minCandidateFrames: 2, minLockFrames: 4, lostGraceMs: 350 }}
-            centerline={{ algorithm: 'pca', bins: 48 }}
-            stability={{ windowMs: 750, minDepthCoverage: 0.7 }}
+            centerline={{
+              algorithm: 'pca',
+              bins: 48,
+              depthTransverseSamples: 7,
+              depthTransverseInsetFraction: 0.15,
+              depthForegroundQuantile: 0.25,
+              maxDepthStepM: 0.08,
+              maxDepthStepFraction: 0.12,
+              depthEnvelopeMarginM: 0.05,
+            }}
+            stability={{
+              windowMs: 750,
+              maxDeltaCm: 1,
+              maxDeltaFraction: 0.025,
+              trimOutlierFrames: 1,
+              minDepthCoverage: 0.6,
+            }}
             overlay={{ contourMaxPoints: 120, emitCenterline: true }}
             debugMode
             onSubject={handleSubject}
@@ -323,6 +338,13 @@ export function MeasureScreen() {
                   ? `${topClassifier.label} ${Math.round(topClassifier.confidence * 100)}%`
                   : 'waiting for classifier/depth'}
             </Text>
+            {measurement?.stabilitySpreadM != null &&
+            measurement.stabilityAllowedDeltaM != null ? (
+              <Text style={styles.diagnosticText}>
+                spread {(measurement.stabilitySpreadM * 100).toFixed(1)} /{' '}
+                {(measurement.stabilityAllowedDeltaM * 100).toFixed(1)} cm
+              </Text>
+            ) : null}
           </View>
         ) : null}
 

@@ -74,6 +74,12 @@ export type CenterlineConfig = {
   algorithm?: 'pca' | 'skeleton';
   bins?: number;
   depthSampleRadiusPx?: number;
+  depthTransverseSamples?: number;
+  depthTransverseInsetFraction?: number;
+  depthForegroundQuantile?: number;
+  maxDepthStepM?: number;
+  maxDepthStepFraction?: number;
+  depthEnvelopeMarginM?: number;
   depthFitDegree?: number;
   outlierRejectSigma?: number;
   maxGapBinFraction?: number;
@@ -90,6 +96,7 @@ export type StabilityConfig = {
   windowMs?: number;
   maxDeltaCm?: number;
   maxDeltaFraction?: number;
+  trimOutlierFrames?: number;
   minDistanceM?: number;
   maxDistanceM?: number;
   minDepthCoverage?: number;
@@ -135,6 +142,9 @@ export type FishMeasurementEvent = {
   confidence: number;
   stable: boolean;
   stableForMs: number;
+  stabilitySpreadM?: number;
+  stabilityAllowedDeltaM?: number;
+  stabilityWindowCovered?: boolean;
   autoCaptureEligible: boolean;
   timestampMs: number;
   frameTimestampS: number;

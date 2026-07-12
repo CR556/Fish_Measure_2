@@ -14,6 +14,9 @@ struct StabilitySample: Sendable {
 struct StabilitySnapshot: Sendable {
   let stable: Bool
   let stableForMs: Double
+  let spreadM: Double
+  let allowedDeltaM: Double
+  let windowCovered: Bool
   let medianCurvedM: Double
   let standardDeviationM: Double
   let frames: Int
@@ -39,10 +42,15 @@ final class StabilityGate {
     let variance = lengths.reduce(0) { $0 + pow($1 - mean, 2) } / Double(max(1, lengths.count))
     let stddev = sqrt(variance)
     let allowedDelta = max(params.maxDeltaCm / 100, medianLength * params.maxDeltaFraction)
-    let spread = (lengths.max() ?? 0) - (lengths.min() ?? 0)
+    let sortedLengths = lengths.sorted()
+    let requestedTrim = min(max(params.trimOutlierFrames, 0), 3)
+    let trim = sortedLengths.count >= requestedTrim * 2 + 4 ? requestedTrim : 0
+    let robustLengths = Array(sortedLengths.dropFirst(trim).dropLast(trim))
+    let spread = (robustLengths.max() ?? 0) - (robustLengths.min() ?? 0)
     let windowCovered = (samples.last?.timestamp ?? 0) - (samples.first?.timestamp ?? 0)
       >= params.windowMs / 1000 * 0.8
-    let stable = samples.count >= 4 && windowCovered && spread <= allowedDelta
+    let latestNearMedian = abs(sample.curvedM - medianLength) <= allowedDelta
+    let stable = samples.count >= 4 && windowCovered && spread <= allowedDelta && latestNearMedian
       && sample.distanceM >= params.minDistanceM && sample.distanceM <= params.maxDistanceM
       && sample.depthCoverage >= params.minDepthCoverage
     if stable {
@@ -56,6 +64,9 @@ final class StabilityGate {
     return StabilitySnapshot(
       stable: stable,
       stableForMs: stableSince.map { max(0, sample.timestamp - $0) * 1000 } ?? 0,
+      spreadM: spread,
+      allowedDeltaM: allowedDelta,
+      windowCovered: windowCovered,
       medianCurvedM: medianLength,
       standardDeviationM: stddev,
       frames: samples.count,

@@ -20,17 +20,17 @@ final class DepthLifter {
     params: CenterlineParams
   ) -> LiftedMeasurement? {
     let radius = min(max(params.depthSampleRadiusPx, 0), 5)
-    var rawDepths: [Double?] = centerline.points.map {
-      medianDepth(
-        normalizedPoint: $0,
-        depthMap: packet.depthMap,
-        confidenceMap: packet.confidenceMap,
-        minimumConfidence: segmentation.minDepthConfidence,
-        radius: radius)
-    }
+    var rawDepths = sampleForegroundDepths(
+      centerline: centerline,
+      depthMap: packet.depthMap,
+      confidenceMap: packet.confidenceMap,
+      minimumConfidence: segmentation.minDepthConfidence,
+      radius: radius,
+      params: params)
+    rawDepths = rejectDepthDiscontinuities(rawDepths, params: params)
     let validCount = rawDepths.compactMap { $0 }.count
-    let coverage = Double(validCount) / Double(max(1, rawDepths.count))
-    guard coverage >= params.minValidBinFraction,
+    let initialCoverage = Double(validCount) / Double(max(1, rawDepths.count))
+    guard initialCoverage >= params.minValidBinFraction,
           maximumGapFraction(rawDepths) <= params.maxGapBinFraction else { return nil }
 
     let degree = min(max(params.depthFitDegree, 1), 5)
@@ -52,8 +52,17 @@ final class DepthLifter {
       coefficients = refit
     }
 
-    let fitted = centerline.points.indices.map {
-      evaluate(coefficients, t: normalizedT($0, centerline.points.count))
+    let finalValidCount = rawDepths.compactMap { $0 }.count
+    let coverage = Double(finalValidCount) / Double(max(1, rawDepths.count))
+    guard coverage >= params.minValidBinFraction,
+          maximumGapFraction(rawDepths) <= params.maxGapBinFraction else { return nil }
+    let acceptedDepths = rawDepths.compactMap { $0 }
+    guard let minimumAccepted = acceptedDepths.min(), let maximumAccepted = acceptedDepths.max()
+    else { return nil }
+    let envelopeMargin = min(max(params.depthEnvelopeMarginM, 0), 0.5)
+    let fitted = centerline.points.indices.map { index in
+      let value = evaluate(coefficients, t: normalizedT(index, centerline.points.count))
+      return min(max(value, minimumAccepted - envelopeMargin), maximumAccepted + envelopeMargin)
     }
     guard fitted.allSatisfy({ $0.isFinite && $0 > 0.05 && $0 < 10 }) else { return nil }
     let world = zip(centerline.points, fitted).map {
@@ -96,23 +105,24 @@ final class DepthLifter {
     return SIMD3(world.x, world.y, world.z)
   }
 
-  private func medianDepth(
-    normalizedPoint: CGPoint,
+  private func sampleForegroundDepths(
+    centerline: Centerline2D,
     depthMap: CVPixelBuffer,
     confidenceMap: CVPixelBuffer?,
     minimumConfidence: Int,
-    radius: Int
-  ) -> Double? {
+    radius: Int,
+    params: CenterlineParams
+  ) -> [Double?] {
     CVPixelBufferLockBaseAddress(depthMap, .readOnly)
     if let confidenceMap { CVPixelBufferLockBaseAddress(confidenceMap, .readOnly) }
     defer {
       if let confidenceMap { CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly) }
       CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
     }
-    guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+    guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else {
+      return [Double?](repeating: nil, count: centerline.points.count)
+    }
     let width = CVPixelBufferGetWidth(depthMap), height = CVPixelBufferGetHeight(depthMap)
-    let x = min(width - 1, max(0, Int(normalizedPoint.x * CGFloat(width))))
-    let y = min(height - 1, max(0, Int(normalizedPoint.y * CGFloat(height))))
     let depthStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
     let depthValues = depthBase.assumingMemoryBound(to: Float32.self)
     let confidenceBase: UnsafeMutablePointer<UInt8>?
@@ -124,15 +134,91 @@ final class DepthLifter {
       confidenceBase = nil
       confidenceStride = 0
     }
-    var values: [Double] = []
-    for yy in max(0, y - radius)...min(height - 1, y + radius) {
-      for xx in max(0, x - radius)...min(width - 1, x + radius) {
-        if let confidenceBase, Int(confidenceBase[yy * confidenceStride + xx]) < minimumConfidence { continue }
-        let value = Double(depthValues[yy * depthStride + xx])
-        if value.isFinite && value > 0.05 && value < 10 { values.append(value) }
+    let transverseCount = min(max(params.depthTransverseSamples, 1), 15)
+    let inset = min(max(params.depthTransverseInsetFraction, 0), 0.45)
+    let foregroundQuantile = min(max(params.depthForegroundQuantile, 0), 0.5)
+
+    func values(around point: CGPoint) -> [Double] {
+      let x = min(width - 1, max(0, Int(point.x * CGFloat(width))))
+      let y = min(height - 1, max(0, Int(point.y * CGFloat(height))))
+      var output: [Double] = []
+      for yy in max(0, y - radius)...min(height - 1, y + radius) {
+        for xx in max(0, x - radius)...min(width - 1, x + radius) {
+          if let confidenceBase,
+             Int(confidenceBase[yy * confidenceStride + xx]) < minimumConfidence { continue }
+          let value = Double(depthValues[yy * depthStride + xx])
+          if value.isFinite && value > 0.05 && value < 10 { output.append(value) }
+        }
+      }
+      return output
+    }
+
+    return centerline.points.indices.map { index in
+      var candidates = values(around: centerline.points[index])
+      if index < centerline.widthSegments.count, transverseCount > 1 {
+        let segment = centerline.widthSegments[index]
+        for sample in 0..<transverseCount {
+          let unit = Double(sample) / Double(transverseCount - 1)
+          let t = CGFloat(inset + (1 - inset * 2) * unit)
+          let point = CGPoint(
+            x: segment.a.x + (segment.b.x - segment.a.x) * t,
+            y: segment.a.y + (segment.b.y - segment.a.y) * t)
+          candidates.append(contentsOf: values(around: point))
+        }
+      }
+      return quantile(candidates, foregroundQuantile)
+    }
+  }
+
+  /// Starting from a representative body sample, walk toward both tips and
+  /// discard sudden depth jumps. A real curved fish changes depth smoothly;
+  /// an exposed background pixel behind a thin tail does not.
+  private func rejectDepthDiscontinuities(
+    _ depths: [Double?],
+    params: CenterlineParams
+  ) -> [Double?] {
+    guard depths.count >= 3 else { return depths }
+    let lower = depths.count / 4
+    let upper = min(depths.count - 1, depths.count * 3 / 4)
+    let central = (lower...upper).compactMap { index -> (Int, Double)? in
+      depths[index].map { (index, $0) }
+    }
+    guard !central.isEmpty else { return depths }
+    let centralMedian = median(central.map { $0.1 })
+    guard let seed = central.min(by: { abs($0.1 - centralMedian) < abs($1.1 - centralMedian) })
+    else { return depths }
+    var filtered = depths
+    let fixedLimit = min(max(params.maxDepthStepM, 0.005), 0.5)
+    let fractionalLimit = min(max(params.maxDepthStepFraction, 0), 0.5)
+
+    func accepted(_ value: Double, after previous: Double) -> Bool {
+      abs(value - previous) <= max(fixedLimit, abs(previous) * fractionalLimit)
+    }
+
+    var previous = seed.1
+    if seed.0 + 1 < depths.count {
+      for index in (seed.0 + 1)..<depths.count {
+        guard let value = depths[index] else { continue }
+        if accepted(value, after: previous) { previous = value }
+        else { filtered[index] = nil }
       }
     }
-    return values.isEmpty ? nil : median(values)
+    previous = seed.1
+    if seed.0 > 0 {
+      for index in stride(from: seed.0 - 1, through: 0, by: -1) {
+        guard let value = depths[index] else { continue }
+        if accepted(value, after: previous) { previous = value }
+        else { filtered[index] = nil }
+      }
+    }
+    return filtered
+  }
+
+  private func quantile(_ values: [Double], _ fraction: Double) -> Double? {
+    guard !values.isEmpty else { return nil }
+    let sorted = values.sorted()
+    let index = min(sorted.count - 1, max(0, Int(Double(sorted.count - 1) * fraction)))
+    return sorted[index]
   }
 
   private func maximumGapFraction(_ values: [Double?]) -> Double {
