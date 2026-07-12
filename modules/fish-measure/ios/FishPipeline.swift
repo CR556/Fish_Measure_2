@@ -142,7 +142,11 @@ final class FishPipeline {
   ) {
     let started = CACurrentMediaTime()
     stateLock.lock(); latestSnapshot = nil; stateLock.unlock()
-    let (segmentation, classifier, tracking, centerline, girth, stability, overlay) = config
+    let (configuredSegmentation, classifier, tracking, centerline, girth, stability, overlay) = config
+    var segmentation = configuredSegmentation
+    segmentation.priorityRegion = sensorPriorityRegion(
+      configuredSegmentation.priorityRegion,
+      packet: packet)
     let tapHint = currentTapHint(packet: packet, ttlMs: tracking.tapHintTtlMs)
     let segmentationStart = CACurrentMediaTime()
     let subject: SegmentedSubject?
@@ -244,6 +248,29 @@ final class FishPipeline {
       tapHintViewPoint,
       viewSize: packet.viewSize,
       displayTransform: packet.displayTransform)
+  }
+
+  /// The JS priority region is normalized in the RN view. Subject masks are
+  /// canonicalized to camera-sensor coordinates, so account for ARKit's
+  /// aspect-fill display transform before comparing mask centroids.
+  private func sensorPriorityRegion(_ region: RegionParams, packet: FramePacket) -> RegionParams {
+    let corners = [
+      CGPoint(x: region.x, y: region.y),
+      CGPoint(x: region.x + region.w, y: region.y),
+      CGPoint(x: region.x + region.w, y: region.y + region.h),
+      CGPoint(x: region.x, y: region.y + region.h),
+    ].map {
+      CoordinateMapper.viewToImageNormalized(
+        CGPoint(x: $0.x * packet.viewSize.width, y: $0.y * packet.viewSize.height),
+        viewSize: packet.viewSize,
+        displayTransform: packet.displayTransform)
+    }
+    var converted = RegionParams()
+    converted.x = Double(corners.map(\.x).min() ?? 0)
+    converted.y = Double(corners.map(\.y).min() ?? 0)
+    converted.w = Double((corners.map(\.x).max() ?? 1) - CGFloat(converted.x))
+    converted.h = Double((corners.map(\.y).max() ?? 1) - CGFloat(converted.y))
+    return converted
   }
 
   private func emitEmpty(frameId: Int, packet: FramePacket, tracking: TrackingParams) {

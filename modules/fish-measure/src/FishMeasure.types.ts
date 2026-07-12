@@ -32,6 +32,8 @@ export type SmoothingConfig = {
 export type SegmentationConfig = {
   hz?: number;
   depthSource?: 'raw' | 'smoothed';
+  /** Vision input orientation. Defaults to `right` for the rear portrait camera. */
+  visionOrientation?: 'right' | 'left' | 'up' | 'down';
   minDepthConfidence?: 0 | 1 | 2;
   personExclusion?: boolean;
   personMaskDilationPx?: number;

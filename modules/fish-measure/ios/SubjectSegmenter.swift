@@ -126,6 +126,47 @@ struct BinaryMask: Sendable {
 
   func closed(radius: Int) -> BinaryMask { dilated(radius: radius).eroded(radius: radius) }
 
+  /// Vision returns masks in the oriented image space supplied to its request
+  /// handler. ARKit display transforms, scene depth, intrinsics, and captured
+  /// image sampling all use the camera sensor's native landscape coordinates.
+  /// Canonicalizing here keeps every downstream consumer in sensor space.
+  func convertedFromVisionToSensor(_ orientation: String) -> BinaryMask {
+    switch orientation {
+    case "left":
+      var output = BinaryMask(
+        width: height, height: width,
+        pixels: [UInt8](repeating: 0, count: pixels.count))
+      for sensorY in 0..<output.height {
+        for sensorX in 0..<output.width {
+          output[sensorX, sensorY] = self[sensorY, height - 1 - sensorX]
+        }
+      }
+      return output
+    case "up":
+      return self
+    case "down":
+      var output = BinaryMask(
+        width: width, height: height,
+        pixels: [UInt8](repeating: 0, count: pixels.count))
+      for sensorY in 0..<height {
+        for sensorX in 0..<width {
+          output[sensorX, sensorY] = self[width - 1 - sensorX, height - 1 - sensorY]
+        }
+      }
+      return output
+    default: // Vision `.right`: oriented (x,y) came from sensor (y,1-x).
+      var output = BinaryMask(
+        width: height, height: width,
+        pixels: [UInt8](repeating: 0, count: pixels.count))
+      for sensorY in 0..<output.height {
+        for sensorX in 0..<output.width {
+          output[sensorX, sensorY] = self[width - 1 - sensorY, sensorX]
+        }
+      }
+      return output
+    }
+  }
+
   func largestComponent() -> (mask: BinaryMask, fraction: Double) {
     var visited = [Bool](repeating: false, count: pixels.count)
     var best: [Int] = []
@@ -178,7 +219,10 @@ final class SubjectSegmenter {
       return try segmentWithRuntimeModel(image: image, params: params, descriptor: descriptor)
     }
     let request = VNGenerateForegroundInstanceMaskRequest()
-    let handler = VNImageRequestHandler(cvPixelBuffer: image, orientation: .right, options: [:])
+    let handler = VNImageRequestHandler(
+      cvPixelBuffer: image,
+      orientation: Self.exifOrientation(params.visionOrientation),
+      options: [:])
     try handler.perform([request])
     guard let observation = request.results?.first else { return nil }
     let instances = observation.allInstances
@@ -203,6 +247,7 @@ final class SubjectSegmenter {
       if let personMask {
         mask = mask.subtracting(personMask, dilation: max(0, params.personMaskDilationPx))
       }
+      mask = mask.convertedFromVisionToSensor(params.visionOrientation)
       mask = mask.closed(radius: max(0, params.subjectClosingPx))
       let component = mask.largestComponent()
       guard component.fraction >= params.minComponentFraction else { continue }
@@ -249,7 +294,10 @@ final class SubjectSegmenter {
     case "aspectFill": request.imageCropAndScaleOption = .centerCrop
     default: request.imageCropAndScaleOption = .scaleFit
     }
-    let handler = VNImageRequestHandler(cvPixelBuffer: image, orientation: .right, options: [:])
+    let handler = VNImageRequestHandler(
+      cvPixelBuffer: image,
+      orientation: Self.exifOrientation(params.visionOrientation),
+      options: [:])
     try handler.perform([request])
     let buffer: CVPixelBuffer?
     if let observation = request.results?.first as? VNPixelBufferObservation {
@@ -275,6 +323,7 @@ final class SubjectSegmenter {
         mask = mask.subtracting(personMask, dilation: max(0, params.personMaskDilationPx))
       }
     }
+    mask = mask.convertedFromVisionToSensor(params.visionOrientation)
     mask = mask.closed(radius: max(0, params.subjectClosingPx))
     let component = mask.largestComponent()
     guard component.fraction >= params.minComponentFraction else { return nil }
@@ -305,5 +354,14 @@ final class SubjectSegmenter {
     runtimeVersion = descriptor.version
     runtimeVisionModel = visionModel
     return visionModel
+  }
+
+  private static func exifOrientation(_ value: String) -> CGImagePropertyOrientation {
+    switch value {
+    case "left": return .left
+    case "up": return .up
+    case "down": return .down
+    default: return .right
+    }
   }
 }

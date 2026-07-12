@@ -42,6 +42,7 @@ struct RegionParams: Record {
 struct SegmentationParams: Record {
   @Field var hz: Double = 10
   @Field var depthSource: String = "smoothed"
+  @Field var visionOrientation: String = "right"
   @Field var minDepthConfidence: Int = 1
   @Field var personExclusion: Bool = true
   @Field var personMaskDilationPx: Int = 2
