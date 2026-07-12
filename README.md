@@ -5,8 +5,8 @@ measure a fish from nose to tail, preserve a measurement-linked photo, estimate
 girth and weight, identify the species and visible bait, and maintain a private
 on-device catch log.
 
-> Status: active implementation. The Expo/navigation scaffold and revised
-> native contract are present; the Round 1 Swift pipeline is not yet complete.
+> Status: active implementation. The Round 1 Swift pipeline compiles under
+> Xcode 26/Swift 6.2; on-phone accuracy and thermal verification are pending.
 
 ## Product rules
 
